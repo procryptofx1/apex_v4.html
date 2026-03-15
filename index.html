@@ -824,57 +824,174 @@ let sessionPnl=0, compounded=0;
 let tgTok='', tgCid='', tgOn=false;
 let tickN=0, timer=null;
 let masterStrat='auto';
+let cooldown=0; // bars since last trade — prevents overtrading
 const SNAMES=['RSI','EMA','MACD'];
+const MIN_AGREE=2;     // at least 2/3 strategies must agree before entering
+const MIN_CONF=68;     // minimum confidence threshold
+const CHOP_FILTER=0.4; // ADX-style choppiness filter — skip sideways markets
 
-// Seed history
-for(let i=0;i<150;i++){
-  price+=(Math.random()-.5)*200;
+// Seed history with realistic BTC trend
+for(let i=0;i<200;i++){
+  price+=(Math.random()-.48)*180; // slight upward bias
   price=Math.max(50000,Math.min(115000,price));
   pH.push(price);
-  candles.push({o:price+(Math.random()-.5)*150,h:price+Math.random()*200,l:price-Math.random()*200,c:price});
+  const spread=price*(0.001+Math.random()*.002);
+  candles.push({o:price-spread/2,h:price+spread,l:price-spread,c:price+spread*(Math.random()-.5)});
 }
 
 // ── MATH ──────────────────────────────────────────────────────────────────────
-const ema=(a,p)=>{const k=2/(p+1);let e=a[0];for(let i=1;i<a.length;i++)e=a[i]*k+e*(1-k);return e;};
+const ema=(a,p)=>{
+  if(a.length===0)return 0;
+  const k=2/(p+1);let e=a[0];
+  for(let i=1;i<a.length;i++)e=a[i]*k+e*(1-k);
+  return e;
+};
 const rsi=(a,p=14)=>{
   if(a.length<p+1)return 50;
   let g=0,l=0;
   for(let i=a.length-p;i<a.length;i++){const d=a[i]-a[i-1];d>0?g+=d:l-=d;}
-  return 100-100/(1+g/Math.max(l,1e-9));
+  const rs=g/Math.max(l,1e-9);
+  return 100-100/(1+rs);
 };
-const macd=(a)=>{
-  if(a.length<26)return{m:0,h:0};
-  const m=ema(a.slice(-12),12)-ema(a.slice(-26),26);
-  return{m,h:m*.12};
+const calcMACD=(a)=>{
+  if(a.length<26)return{m:0,sig:0,hist:0};
+  const fast=ema(a.slice(-12),12);
+  const slow=ema(a.slice(-26),26);
+  const m=fast-slow;
+  // Signal line = 9-period EMA of MACD
+  const prevM=a.length>27?ema(a.slice(-13),12)-ema(a.slice(-27),26):m;
+  const signal=ema([prevM,m],9);
+  return{m,sig:signal,hist:m-signal};
 };
-const bb=(a,p=20)=>{
-  const s=a.slice(-p),mean=s.reduce((x,y)=>x+y,0)/s.length;
+const calcBB=(a,p=20)=>{
+  if(a.length<p)return{upper:price*1.02,lower:price*.98,mid:price,pct:50,width:0.02};
+  const s=a.slice(-p);
+  const mean=s.reduce((x,y)=>x+y,0)/s.length;
   const std=Math.sqrt(s.reduce((x,y)=>x+(y-mean)**2,0)/s.length);
-  return{upper:mean+2*std,lower:mean-2*std,pct:std>0?((a[a.length-1]-(mean-2*std))/(4*std))*100:50};
+  const cur=a[a.length-1];
+  const width=std>0?(4*std)/mean:0;
+  return{upper:mean+2*std,lower:mean-2*std,mid:mean,pct:std>0?((cur-(mean-2*std))/(4*std))*100:50,width};
 };
 
-// ── SIGNALS ───────────────────────────────────────────────────────────────────
+// ATR — Average True Range (volatility measure)
+const calcATR=(cands,p=14)=>{
+  if(cands.length<p+1)return price*0.012;
+  const trs=[];
+  for(let i=cands.length-p;i<cands.length;i++){
+    const h=cands[i].h,l=cands[i].l,pc=cands[i-1]?.c||l;
+    trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));
+  }
+  return trs.reduce((a,b)=>a+b,0)/trs.length;
+};
+
+// Market regime: returns 'TREND_UP','TREND_DOWN','CHOP'
+function marketRegime(a){
+  if(a.length<50)return 'TREND_UP';
+  const e20=ema(a.slice(-20),20);
+  const e50=ema(a.slice(-50),50);
+  const e9=ema(a.slice(-9),9);
+  const cur=a[a.length-1];
+
+  // Check trend alignment
+  const bullAlign=cur>e9&&e9>e20&&e20>e50;
+  const bearAlign=cur<e9&&e9<e20&&e20<e50;
+
+  // Choppiness: how much price moved vs range
+  const hi=Math.max(...a.slice(-20));
+  const lo=Math.min(...a.slice(-20));
+  const range=hi-lo;
+  const netMove=Math.abs(a[a.length-1]-a[a.length-20]);
+  const choppiness=range>0?netMove/range:0;
+
+  if(choppiness<CHOP_FILTER)return 'CHOP'; // sideways — skip
+  if(bullAlign)return 'TREND_UP';
+  if(bearAlign)return 'TREND_DOWN';
+  return 'NEUTRAL';
+}
+
+// ── SMART SIGNAL ENGINE ───────────────────────────────────────────────────────
+// Each signal returns: {sig:'BUY'|'SELL'|'HOLD', conf:0-100, reason:string}
+
 function rsiSig(a){
+  if(a.length<20)return{sig:'HOLD',conf:0,reason:'Collecting data...'};
   const r=rsi(a);
-  if(r<33)return{sig:'BUY',conf:Math.min(92,70+(33-r)*1.4),reason:`RSI ${r.toFixed(1)} — oversold`};
-  if(r>67)return{sig:'SELL',conf:Math.min(92,68+(r-67)*1.3),reason:`RSI ${r.toFixed(1)} — overbought`};
-  return{sig:'HOLD',conf:44,reason:`RSI ${r.toFixed(1)} — neutral`};
+  const r5=rsi(a.slice(-6),5); // short RSI for confirmation
+  // Strong oversold: both RSIs confirm
+  if(r<30&&r5<35)return{sig:'BUY',conf:Math.min(94,76+(30-r)*1.8),reason:`RSI ${r.toFixed(1)} deeply oversold`};
+  if(r<38&&r5<42)return{sig:'BUY',conf:Math.min(82,64+(38-r)*1.5),reason:`RSI ${r.toFixed(1)} — oversold`};
+  // Strong overbought
+  if(r>70&&r5>65)return{sig:'SELL',conf:Math.min(94,74+(r-70)*1.8),reason:`RSI ${r.toFixed(1)} deeply overbought`};
+  if(r>62&&r5>58)return{sig:'SELL',conf:Math.min(82,62+(r-62)*1.5),reason:`RSI ${r.toFixed(1)} — overbought`};
+  return{sig:'HOLD',conf:30,reason:`RSI ${r.toFixed(1)} — neutral zone`};
 }
+
 function emaSig(a){
-  if(a.length<22)return{sig:'HOLD',conf:40,reason:'Collecting data...'};
-  const e9=ema(a.slice(-9),9),e21=ema(a.slice(-21),21);
+  if(a.length<55)return{sig:'HOLD',conf:0,reason:'Collecting data...'};
+  const e9=ema(a.slice(-9),9);
+  const e21=ema(a.slice(-21),21);
+  const e50=ema(a.slice(-50),50);
   const p9=ema(a.slice(-10,-1),9);
-  if(e9>e21&&p9<=e21)return{sig:'BUY',conf:78,reason:'EMA9 crossed above EMA21'};
-  if(e9<e21&&p9>=e21)return{sig:'SELL',conf:75,reason:'EMA9 crossed below EMA21'};
-  return{sig:e9>e21?'BUY':'SELL',conf:54,reason:`EMA trend ${e9>e21?'bullish':'bearish'}`};
+  const p21=ema(a.slice(-22,-1),21);
+  const cur=a[a.length-1];
+
+  // Golden cross (9 crosses 21) WITH price above 50 EMA = strong BUY
+  if(e9>e21&&p9<=p21&&cur>e50)return{sig:'BUY',conf:86,reason:'Golden cross + above EMA50'};
+  // Death cross WITH price below 50 EMA = strong SELL
+  if(e9<e21&&p9>=p21&&cur<e50)return{sig:'SELL',conf:84,reason:'Death cross + below EMA50'};
+  // Trend continuation: all EMAs aligned
+  if(cur>e9&&e9>e21&&e21>e50)return{sig:'BUY',conf:72,reason:'EMA stack bullish — trend up'};
+  if(cur<e9&&e9<e21&&e21<e50)return{sig:'SELL',conf:70,reason:'EMA stack bearish — trend down'};
+  // Weak signals
+  if(e9>e21)return{sig:'BUY',conf:52,reason:`EMA9 above EMA21`};
+  if(e9<e21)return{sig:'SELL',conf:50,reason:`EMA9 below EMA21`};
+  return{sig:'HOLD',conf:30,reason:'EMA flat'};
 }
+
 function macdSig(a){
-  const{m,h}=macd(a);
-  if(m>10)return{sig:'BUY',conf:Math.min(88,62+Math.min(m,26)),reason:`MACD +${m.toFixed(1)} — bullish`};
-  if(m<-10)return{sig:'SELL',conf:Math.min(88,60+Math.min(-m,28)),reason:`MACD ${m.toFixed(1)} — bearish`};
-  return{sig:'HOLD',conf:44,reason:`MACD flat (${m.toFixed(1)})`};
+  if(a.length<30)return{sig:'HOLD',conf:0,reason:'Collecting data...'};
+  const{m,sig,hist}=calcMACD(a);
+  const prevHist=calcMACD(a.slice(0,-1)).hist;
+
+  // MACD line crosses signal line upward = BUY
+  if(hist>0&&prevHist<=0)return{sig:'BUY',conf:Math.min(90,70+Math.min(Math.abs(hist),20)),reason:`MACD bullish crossover`};
+  // MACD line crosses signal line downward = SELL
+  if(hist<0&&prevHist>=0)return{sig:'SELL',conf:Math.min(90,68+Math.min(Math.abs(hist),22)),reason:`MACD bearish crossover`};
+  // Histogram growing (momentum building)
+  if(hist>0&&hist>prevHist&&m>0)return{sig:'BUY',conf:Math.min(80,58+Math.min(hist,22)),reason:`MACD momentum building`};
+  if(hist<0&&hist<prevHist&&m<0)return{sig:'SELL',conf:Math.min(80,56+Math.min(-hist,22)),reason:`MACD selling momentum`};
+  // Weak
+  if(m>0)return{sig:'BUY',conf:45,reason:`MACD above zero`};
+  if(m<0)return{sig:'SELL',conf:43,reason:`MACD below zero`};
+  return{sig:'HOLD',conf:30,reason:`MACD flat`};
 }
+
 const sigFns=[rsiSig,emaSig,macdSig];
+
+// ── CONSENSUS ENGINE — the key upgrade ────────────────────────────────────────
+// Only trades when 2+ strategies agree AND market is not choppy
+function getConsensus(a){
+  const sigs=sigFns.map(fn=>fn(a));
+  const buys=sigs.filter(s=>s.sig==='BUY');
+  const sells=sigs.filter(s=>s.sig==='SELL');
+  const regime=marketRegime(a);
+
+  // Block all trades in choppy markets
+  if(regime==='CHOP')return{action:'HOLD',conf:0,reason:'Choppy market — waiting for trend',regime,sigs};
+
+  // Count agreements
+  const buyCount=buys.length;
+  const sellCount=sells.length;
+
+  if(buyCount>=MIN_AGREE&&regime!=='TREND_DOWN'){
+    const avgConf=Math.round(buys.reduce((a,b)=>a+b.conf,0)/buys.length);
+    if(avgConf>=MIN_CONF)return{action:'BUY',conf:avgConf,reason:buys[0].reason,regime,sigs};
+  }
+  if(sellCount>=MIN_AGREE&&regime!=='TREND_UP'){
+    const avgConf=Math.round(sells.reduce((a,b)=>a+b.conf,0)/sells.length);
+    if(avgConf>=MIN_CONF)return{action:'SELL',conf:avgConf,reason:sells[0].reason,regime,sigs};
+  }
+  return{action:'HOLD',conf:0,reason:`Waiting for consensus (${buyCount}B/${sellCount}S)`,regime,sigs};
+}
 
 // ── TRADE ENGINE ──────────────────────────────────────────────────────────────
 function runStrat(i){
@@ -883,20 +1000,52 @@ function runStrat(i){
   const tp=+document.getElementById('ri1').value/100;
   const sz=+document.getElementById('ri2').value/100;
   const mdl=+document.getElementById('ri3').value/100;
+
+  // Hard stop: daily loss limit hit
   if(sessionPnl<-startBal*mdl)return;
-  const sig=sigFns[i](pH.slice(-80));
+
+  // Cooldown between trades — prevents overtrading
+  if(cooldown>0)return;
+
+  const arr=pH.slice(-100);
+  const atr=calcATR(candles.slice(-20));
+
+  // Use per-strategy signal for display, but consensus for entry
+  const consensus=getConsensus(arr);
+  const indivSig=sigFns[i](arr);
+
   if(openPos[i]){
     const op=openPos[i];
-    const pct=op.side==='BUY'?(price-op.entry)/op.entry:(op.entry-price)/op.entry;
-    if(pct<=-sl||pct>=tp||(sig.sig!=='HOLD'&&sig.sig!==op.side&&sig.conf>62)){
-      closePos(i,pct*op.size,pct);
+    const rawPct=op.side==='BUY'?(price-op.entry)/op.entry:(op.entry-price)/op.entry;
+
+    // Dynamic stop loss: ATR-based (wider = fewer stop-outs)
+    const atrSL=Math.max(sl,(atr/price)*1.5);
+    const atrTP=Math.max(tp,(atr/price)*3.0); // TP always 2x the SL
+
+    // Exit conditions:
+    // 1. Stop loss hit
+    // 2. Take profit hit
+    // 3. Consensus flips against our position with high confidence
+    const consensusFlip=consensus.action!=='HOLD'&&consensus.action!==op.side&&consensus.conf>72;
+    if(rawPct<=-atrSL||rawPct>=atrTP||consensusFlip){
+      closePos(i,rawPct*op.size,rawPct);
+      cooldown=8; // wait 8 ticks before next trade
     }
     return;
   }
-  if(sig.sig!=='HOLD'&&sig.conf>62){
-    openPos[i]={side:sig.sig,entry:price,size:balance*sz/3,time:new Date()};
+
+  // Only enter on full consensus, not just individual strategy signal
+  if(consensus.action!=='HOLD'&&consensus.conf>=MIN_CONF&&sActive.filter(Boolean).length>=MIN_AGREE){
+    // Extra filter: only BUY if RSI not overbought, only SELL if RSI not oversold
+    const r=rsi(arr);
+    if(consensus.action==='BUY'&&r>72)return;  // RSI too high to buy
+    if(consensus.action==='SELL'&&r<28)return; // RSI too low to sell
+
+    const tradeSize=balance*sz/sActive.filter(Boolean).length;
+    openPos[i]={side:consensus.action,entry:price,size:tradeSize,time:new Date()};
   }
 }
+
 function closePos(i,pnlD,pct){
   balance+=pnlD;sessionPnl+=pnlD;
   if(pnlD>0)compounded+=pnlD;
@@ -971,31 +1120,56 @@ function drawChart(){
 
 // ── INDICATORS ────────────────────────────────────────────────────────────────
 function updateInds(){
-  const a=pH.slice(-80);if(a.length<26)return;
-  const r=rsi(a),{m}=macd(a);
+  const a=pH.slice(-100);if(a.length<26)return;
+  const r=rsi(a);
+  const{m,hist}=calcMACD(a);
   const e9=ema(a.slice(-9),9),e21=ema(a.slice(-21),21);
-  const bv=bb(a);const vl=50+Math.random()*35;
+  const bv=calcBB(a);
+  const atr=calcATR(candles.slice(-20));
+  const atrPct=Math.min(100,(atr/price)*100*8); // scale for display
+
   const si=(i,pct,col,txt)=>{
     document.getElementById('if'+i).style.cssText=`width:${Math.max(2,Math.min(100,pct))}%;background:${col}`;
     document.getElementById('iv'+i).textContent=txt;
     document.getElementById('iv'+i).style.color=col;
   };
   si(0,r,r>70?'#ff3f58':r<30?'#00e5a0':'#f5a623',r.toFixed(1));
-  const mp=Math.max(0,Math.min(100,(m+400)/8));
-  si(1,mp,m>0?'#00e5a0':'#ff3f58',m.toFixed(1));
-  si(2,e9>e21?68:32,e9>e21?'#00e5a0':'#ff3f58',e9>e21?'BULL':'BEAR');
-  si(3,bv.pct,bv.pct>70?'#ff3f58':bv.pct<30?'#00e5a0':'#6b8296',bv.pct.toFixed(0)+'%');
-  si(4,vl,'#12b0f8',vl.toFixed(0)+'%');
+  const mp=Math.max(0,Math.min(100,50+(hist/price)*5000));
+  si(1,mp,hist>0?'#00e5a0':'#ff3f58',m.toFixed(1));
+  si(2,e9>e21?72:28,e9>e21?'#00e5a0':'#ff3f58',e9>e21?'BULL':'BEAR');
+  si(3,bv.pct,bv.pct>75?'#ff3f58':bv.pct<25?'#00e5a0':'#6b8296',bv.pct.toFixed(0)+'%');
+  si(4,atrPct,'#12b0f8',(atr/price*100).toFixed(2)+'%');
 }
 
-// ── STRATEGY CARDS ────────────────────────────────────────────────────────────
+// ── STRATEGY CARDS — show individual signals + consensus status ────────────────
 function updateCards(){
+  const arr=pH.slice(-100);
+  const consensus=getConsensus(arr);
+
+  // Update regime indicator in status bar
+  const regimeColors={'TREND_UP':'var(--g)','TREND_DOWN':'var(--r)','NEUTRAL':'var(--amber)','CHOP':'var(--txt3)'};
+  const regimeLbls={'TREND_UP':'TRENDING UP','TREND_DOWN':'TRENDING DOWN','NEUTRAL':'NEUTRAL','CHOP':'CHOPPY — SKIP'};
+  document.getElementById('scanTime').textContent=`Market: ${regimeLbls[consensus.regime]||'—'}`;
+  document.getElementById('scanTime').style.color=regimeColors[consensus.regime]||'var(--txt3)';
+
   sigFns.forEach((fn,i)=>{
-    if(!sActive[i])return;
-    const sig=fn(pH.slice(-80));
+    if(!sActive[i]){
+      document.getElementById('sig'+i).textContent='OFF';
+      document.getElementById('sig'+i).className='sig HOLD';
+      document.getElementById('reason'+i).textContent='Strategy disabled';
+      return;
+    }
+    const sig=fn(arr);
     const b=document.getElementById('sig'+i);
     b.textContent=sig.sig;b.className='sig '+sig.sig;
-    document.getElementById('conf'+i).textContent=`Confidence: ${sig.conf}%`;
+
+    // Show consensus status in confidence
+    const inConsensus=consensus.action===sig.sig&&consensus.action!=='HOLD';
+    document.getElementById('conf'+i).textContent=inConsensus
+      ?`✓ Consensus: ${sig.conf}%`
+      :`Confidence: ${sig.conf}%`;
+    document.getElementById('conf'+i).style.color=inConsensus?'var(--g)':'var(--txt3)';
+
     document.getElementById('fill'+i).style.cssText=`width:${sig.conf}%;background:${sig.sig==='BUY'?'var(--g)':sig.sig==='SELL'?'var(--r)':'var(--amber)'}`;
     document.getElementById('reason'+i).textContent=sig.reason;
     const card=document.getElementById('sc'+i);
@@ -1126,19 +1300,38 @@ function setMasterStrat(v){
 // ── MAIN TICK ─────────────────────────────────────────────────────────────────
 function tick(){
   if(!running)return;
-  const vol=0.0009+Math.random()*.0008;
-  price*=(1+0.00002+(Math.random()-.5)*2*vol);
+
+  // Realistic BTC price simulation with trending phases
+  const trendPhase=Math.sin(tickN/120)*0.00008; // slow trend cycle
+  const vol=0.0007+Math.random()*.0007;
+  const noise=(Math.random()-.5)*2*vol;
+  price*=(1+trendPhase+noise);
   price=Math.max(48000,Math.min(120000,price));
-  pH.push(price);if(pH.length>400)pH.shift();
+
+  pH.push(price);if(pH.length>500)pH.shift();
+
+  // Candle management
   const lc=candles[candles.length-1];
   lc.c=price;lc.h=Math.max(lc.h,price);lc.l=Math.min(lc.l,price);
-  if(tickN%10===0){candles.push({o:price,h:price,l:price,c:price});if(candles.length>200)candles.shift();}
+  if(tickN%12===0){
+    candles.push({o:price,h:price,l:price,c:price});
+    if(candles.length>250)candles.shift();
+  }
+
+  // Price display
   const prev=pH[pH.length-2]||price,chg=price-prev,pct=(chg/prev*100).toFixed(3);
   document.getElementById('vPrice').textContent='$'+Math.round(price).toLocaleString();
-  document.getElementById('vPriceChg').innerHTML=chg>=0?`<span style="color:var(--g)">▲ +${pct}%</span>`:`<span style="color:var(--r)">▼ ${pct}%</span>`;
-  if(tickN%7===0)sActive.forEach((_,i)=>runStrat(i));
+  document.getElementById('vPriceChg').innerHTML=chg>=0
+    ?`<span style="color:var(--g)">▲ +${pct}%</span>`
+    :`<span style="color:var(--r)">▼ ${pct}%</span>`;
+
+  // Decrement cooldown
+  if(cooldown>0)cooldown--;
+
+  // Run strategies every 8 ticks (~9 seconds)
+  if(tickN%8===0)sActive.forEach((_,i)=>runStrat(i));
+
   updateCards();updateInds();updateStats();drawChart();
-  document.getElementById('scanTime').textContent='Scan: just now';
   tickN++;
 }
 
